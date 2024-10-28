@@ -1,3 +1,4 @@
+import json
 import duckdb
 import pandas as pd
 import openai
@@ -57,6 +58,7 @@ class ChatBot:
     data_columns: list[str] = []
     data_sample: str = None
     data_path: str = None
+    df_json: pd.DataFrame = None
 
     def __init__(self, model: str, file_path: str):
         """Initialize the chatbot with a model and data file.
@@ -67,13 +69,21 @@ class ChatBot:
         """
         self.data_path = file_path
         df = pd.read_json(file_path)
+
         for column in df.columns:
             column_type = df[column].dtype
             description = f'Column {column} is of type {column_type}'
             if isinstance(df[column].values[0], dict):
                 keys = pd.json_normalize(df[column]).columns.tolist()
                 description = f'Column {column} is a json column with keys: {keys}'
+                df[column] = df[column].apply(json.dumps)
+
+            if isinstance(df[column].values[0], list):
+                description = f'Column {column} is a list column'
+                df[column] = df[column].apply(json.dumps)
             self.data_columns += f"{column}: {description}\n"
+
+        self.df_json = df
 
         self.data_sample = str(df.head())
         self.memory = []
@@ -108,16 +118,17 @@ class ChatBot:
         Please don't include julian date in the SQL query, 
         because duckdb doesn't support julian date.
         
-        Please notice that some columns may have null values.
-        Please remember to use CAST to convert the data type when necessary,
-        e.g. json_extract(metadata, '$.xxx') is in json column, 
+        Please notice that some columns may have null values,
+        when you group by a column, you need to filter out the null values.
         you need to cast it to basic type like double, int, string, etc.
+        
+        Let's think step by step.
         """
         user_message = list(filter(lambda x: x.role == 'user', self.memory))[-1].content[
             'user_message']
-
+        df_json = self.df_json
         prompt = template.format(
-            data_path=self.data_path, data_schema=self.data_columns,
+            data_path='df_json', data_schema=self.data_columns,
             data_sample=self.data_sample, user_message=user_message)
 
         template_with_prev_template = """
@@ -130,6 +141,7 @@ class ChatBot:
         {prev_sql_error_message}
         ========================================================
         """
+        
         if self.memory[-1].status == 'error':
             prompt += template_with_prev_template.format(
                 prev_sql=self.memory[-1].content['sql'],
@@ -204,7 +216,7 @@ class ChatBot:
             self.memory.append(Memory(role='system', content={
                 'error': 'I am sorry, I cannot answer your question.'
             }, status='error'))
-            return
+            return self.memory[-1].content['error']
 
         prompt = template.format(
             sql_results=self.memory[-1].content, user_message=user_message)
