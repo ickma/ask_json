@@ -8,30 +8,32 @@ from pydantic import BaseModel, Field
 conn = duckdb.connect(database=':memory:')
 
 
-class SqlResponse(BaseModel):
-    """A model representing an SQL response from the chatbot."""
+class AIFeedback(BaseModel):
+    """A model representing an AI feedback response from the chatbot."""
 
     sql: str = Field(description="The SQL query string to be executed")
     intention: str = Field(
         description="The interpreted intention/purpose of the SQL query")
     need_sql: bool = Field(
         description="Whether the chatbot needs to execute a SQL query to answer the question")
-    can_answer: bool = Field(
+    can_answer_by_sql: bool = Field(
         description="""Whether the chatbot can answer the question with executing a SQL query,
         if there is no related columns in the table, the chatbot should return False
         """)
+    can_answer_by_prev_answers: bool = Field(
+        description="Whether the chatbot can answer the question by using the previous answers")
 
 
 class Memory(BaseModel):
     """A model representing a memory/message in the chatbot's conversation history.
 
     Attributes:
-        role (str): Role of the message sender - must be 'user', 'ai', 'system', or 'duckdb'
+        role (str): Role of the message sender - must be 'user', 'ai/feedback','ai/answer' 'system', or 'duckdb'
         content (object): The content/payload of the memory/message
         status (str): Status of the memory - must be 'success', 'error', or 'unfinished'
     """
     role: str = Field(
-        description="Role of the message, must be one of: 'user', 'ai', 'system', or 'duckdb'")
+        description="Role of the message, must be one of: 'user', 'ai/feedback','ai/answer', 'system', or 'duckdb'")
     content: object = Field(description="The content of the memory")
     status: str = Field(
         description="The status of the memory, must be one of: 'success', 'error', "
@@ -60,6 +62,9 @@ class ChatBot:
     data_path: str = None
     df_json: pd.DataFrame = None
 
+    sql_retries: int = 3
+    previous_questions_in_context: int = 3
+
     def __init__(self, model: str, file_path: str):
         """Initialize the chatbot with a model and data file.
 
@@ -70,6 +75,10 @@ class ChatBot:
         self.data_path = file_path
         df = pd.read_json(file_path)
 
+        # Code to generate data columns descriptions
+        # Also need to convert the data type to json string
+        # if it's a json column or list column
+        # because duckdb doesn't support dict or list data type
         for column in df.columns:
             column_type = df[column].dtype
             description = f'Column {column} is of type {column_type}'
@@ -90,7 +99,29 @@ class ChatBot:
         self.model = model
         self.client = openai.OpenAI()
 
-    def get_sql_from_ai(self) -> SqlResponse:
+    def get_previous_questions(self) -> str:
+        """Get the most recent user questions from memory.
+
+        Returns:
+            str: String containing the last N user questions, joined by newlines,
+                where N is determined by previous_questions_in_context.
+        """
+        previous_questions = [x.content['user_message']
+                              for x in self.memory if x.role == 'user']
+        return '\n'.join(previous_questions[-self.previous_questions_in_context:])
+
+    def get_previous_answers(self) -> str:
+        """Get the most recent AI answers from memory.
+
+        Returns:
+            str: String containing the last N AI answers, joined by newlines,
+                where N is determined by previous_questions_in_context.
+        """
+        previous_answers = [x.content['answer']
+                            for x in self.memory if x.role in ['ai/answer', 'system']]
+        return '\n'.join(previous_answers[-self.previous_questions_in_context:])
+
+    def get_sql_from_ai(self) -> AIFeedback:
         """Get an SQL query from the AI model based on the user's message.
 
         This method sends a prompt to the OpenAI model asking it to generate a SQL query
@@ -124,12 +155,14 @@ class ChatBot:
         
         Let's think step by step.
         """
-        user_message = list(filter(lambda x: x.role == 'user', self.memory))[-1].content[
+        current_user_message = list(filter(lambda x: x.role == 'user',
+                                           self.memory))[-1].content[
             'user_message']
+        # ugly code, but it's required if we use duckdb
         df_json = self.df_json
         prompt = template.format(
             data_path='df_json', data_schema=self.data_columns,
-            data_sample=self.data_sample, user_message=user_message)
+            data_sample=self.data_sample, user_message=current_user_message)
 
         template_with_prev_template = """
         We got a sql from you before, but it failed to execute.
@@ -141,8 +174,8 @@ class ChatBot:
         {prev_sql_error_message}
         ========================================================
         """
-        
-        if self.memory[-1].status == 'error':
+
+        if self.memory[-1].role == 'duckdb' and self.memory[-1].status == 'error':
             prompt += template_with_prev_template.format(
                 prev_sql=self.memory[-1].content['sql'],
                 prev_sql_error_message=self.memory[-1].content['error'])
@@ -150,27 +183,29 @@ class ChatBot:
         response = self.client.beta.chat.completions.parse(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            response_format=SqlResponse,
+            response_format=AIFeedback,
         )
         # return response.choices[0].message.parsed
         self.memory.append(
-            Memory(role='ai', content=response.choices[0].message.parsed,
+            Memory(role='ai/feedback', content=response.choices[0].message.parsed,
                    status='success'))
-        try:
-            sql_results = conn.sql(
-                response.choices[0].message.parsed.sql).fetchall()
-            self.memory.append(
-                Memory(role='duckdb', content={
-                    'sql_results': sql_results,
-                    'sql': response.choices[0].message.parsed.sql
-                }, status='success'))
 
-        except Exception as e:
-            self.memory.append(
-                Memory(role='duckdb', content={
-                    'sql': response.choices[0].message.parsed.sql,
-                    'error': str(e)
-                }, status='error'))
+        if response.choices[0].message.parsed.need_sql:
+            try:
+                sql_results = conn.sql(
+                    response.choices[0].message.parsed.sql).fetchall()
+                self.memory.append(
+                    Memory(role='duckdb', content={
+                        'sql_results': sql_results,
+                        'sql': response.choices[0].message.parsed.sql
+                    }, status='success'))
+
+            except Exception as e:
+                self.memory.append(
+                    Memory(role='duckdb', content={
+                        'sql': response.choices[0].message.parsed.sql,
+                        'error': str(e)
+                    }, status='error'))
 
     def generate_response_from_ai(self, user_message: str) -> str:
         """Generate a natural language response from the AI model based on SQL results.
@@ -196,6 +231,16 @@ class ChatBot:
         {user_message}
         Please respond to the user's message based on the SQL query results.
         
+        ========================================================
+        This user may have asked a question before, please use the previous 
+        answer to help you answer the current question.
+        Previous questions:
+        {previous_questions}
+        
+        Previous answers:
+        {previous_answers}
+        ========================================================
+        
         Please respond directly to the user's message,
         don't mention the result is from a SQL query.
         
@@ -206,7 +251,7 @@ class ChatBot:
         self.memory.append(Memory(role='user', content={
             'user_message': user_message
         }, status='unfinished'))
-        for _ in range(3):
+        for _ in range(self.sql_retries):
             self.get_sql_from_ai()
             if self.memory[-1].status == 'success':
                 break
@@ -218,16 +263,34 @@ class ChatBot:
             }, status='error'))
             return self.memory[-1].content['error']
 
+        # Generate response from AI
+        ai_feedback = list(
+            filter(lambda x: x.role == 'ai/feedback', self.memory))[-1].content
+        # Some tricky questions cannot be answered by SQL or previous answers
+        # Questions have no related columns in the table
+        if not ai_feedback.can_answer_by_sql and not ai_feedback.can_answer_by_prev_answers:
+            self.memory.append(Memory(role='system', content={
+                'error': 'I am sorry, I cannot answer your question.'
+            }, status='error'))
+            return self.memory[-1].content['error']
+
+        sql_results = ''
+        if ai_feedback.need_sql:
+            sql_results = self.memory[-1].content['sql_results']
+
         prompt = template.format(
-            sql_results=self.memory[-1].content, user_message=user_message)
+            sql_results=sql_results, user_message=user_message,
+            previous_questions=self.get_previous_questions(),
+            previous_answers=self.get_previous_answers())
 
         response = openai.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
+
         )
         answer = response.choices[0].message.content
         self.memory.append(
-            Memory(role='ai', content={
+            Memory(role='ai/answer', content={
                 'answer': answer
             }, status='success'))
         user_message = list(
